@@ -28,9 +28,15 @@
 #include <linux/inet_diag.h>
 #include <net/tcp.h>
 #include <linux/win_minmax.h>
+#include <linux/version.h>
 
-#define CAL_SCALE 8
-#define CAL_UNIT (1 << CAL_SCALE)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+#define W_CONG_CONTROL_SIG struct sock *sk, u32 acked, int flag, const struct rate_sample *rs
+#define W_ACKED acked
+#else
+#define W_CONG_CONTROL_SIG struct sock *sk, const struct rate_sample *rs
+#define W_ACKED rs->acked_sacked
+#endif
 
 #define BW_SCALE 24
 #define BW_UNIT (1 << BW_SCALE)
@@ -38,16 +44,17 @@
 static int debug = 0;
 module_param(debug, int, 0644);
 
-/* TCP Westwood structure */
 struct westwood {
 	u32    last_bdp;
 	u32    rtt;
-	u32    min_rtt_us;          /* minimum observed RTT */
+	u32    min_rtt_us;
 	u32    rtt_cnt;
 	u32    next_rtt_delivered;
 	struct minmax bw;
 	u32    prior_cwnd;
 	u8     prev_ca_state;
+	u32    accum_delivered;
+	u32    accum_interval_us;
 };
 
 /*
@@ -71,19 +78,20 @@ static void tcp_westwood_init(struct sock *sk)
 	w->rtt_cnt = 0;
 	minmax_reset(&w->bw, w->rtt_cnt, 0);
 	w->next_rtt_delivered = 0;
+	w->accum_delivered = 0;
+	w->accum_interval_us = 0;
 }
 
 static void tcp_westwood_event(struct sock *sk, enum tcp_ca_event event)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct westwood *w = inet_csk_ca(sk);
-
 	switch (event) {
 	case CA_EVENT_COMPLETE_CWR:
-		tp->snd_cwnd = tp->snd_ssthresh = w->last_bdp;
+                break;
+	case CA_EVENT_ECN_IS_CE:
+		/* If the router begs us to slow down, we ignore it. */
 		break;
 	default:
-		/* don't care */
+	        /* don't care */
 		break;
 	}
 }
@@ -100,7 +108,6 @@ static void tcp_westwood_state(struct sock *sk, u8 new_state)
 static u32 tcp_westwood_undo_cwnd(struct sock *sk)
 {
 	struct westwood *w = inet_csk_ca(sk);
-
 	return max_t(u32, 2, w->prior_cwnd);
 }
 
@@ -131,24 +138,53 @@ static void tcp_westwood_cwnd_reduction(struct sock *sk, int newly_acked_sacked,
 	tp->snd_cwnd = tcp_packets_in_flight(tp) + sndcnt;
 }
 
-static void tcp_westwood_cong_control(struct sock *sk, const struct rate_sample *rs)
+static void tcp_westwood_cong_avoid(struct sock *sk, u32 ack, u32 acked)
+{
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct westwood *w = inet_csk_ca(sk);
+    u64 bw_bytes_per_sec;
+    u32 increment;
+    (void)ack;
+
+    if (!tcp_is_cwnd_limited(sk))
+        return;
+
+    bw_bytes_per_sec = (minmax_get(&w->bw) * tp->mss_cache) >> BW_SCALE;
+
+    increment = (u32)((bw_bytes_per_sec * w->min_rtt_us) / (tp->mss_cache * USEC_PER_SEC));
+    increment = max_t(u32, increment, 1);
+
+    if (tp->snd_cwnd < tp->snd_cwnd_clamp)
+        tp->snd_cwnd += increment;
+}
+
+static void tcp_westwood_cong_control(W_CONG_CONTROL_SIG)
 {
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct westwood *w = inet_csk_ca(sk);
 	u8 prev_state = w->prev_ca_state, state = inet_csk(sk)->icsk_ca_state;
-	u64 bw, bdp;
+	u64 bw = 0, bdp;
 
 	if (!before(rs->prior_delivered, w->next_rtt_delivered)) {
 		w->next_rtt_delivered = tp->delivered;
 		w->rtt_cnt++;
 	}
 
-	bw = (u64)rs->delivered * BW_UNIT;
-	do_div(bw, rs->interval_us);
-	minmax_running_max(&w->bw, 10, w->rtt_cnt, bw);
-
 	if (rs->rtt_us > 0 && rs->rtt_us <= w->min_rtt_us)
 		w->min_rtt_us = rs->rtt_us;
+
+	if (rs->interval_us > 0) {
+		w->accum_delivered += rs->delivered;
+		w->accum_interval_us += rs->interval_us;
+
+		if (w->accum_interval_us >= 1000) {
+			bw = (u64)w->accum_delivered * BW_UNIT;
+			do_div(bw, w->accum_interval_us);
+			minmax_running_max(&w->bw, 10, w->rtt_cnt, bw);
+			w->accum_delivered = 0;
+			w->accum_interval_us = 0;
+		}
+	}
 
 	w->prev_ca_state = state;
 	if (state == TCP_CA_Recovery && prev_state != TCP_CA_Recovery) {
@@ -156,16 +192,28 @@ static void tcp_westwood_cong_control(struct sock *sk, const struct rate_sample 
 			w->last_bdp = TCP_INIT_CWND;
 		else {
 			bw = minmax_get(&w->bw);
-			bdp = (u64)bw * w->min_rtt_us;
-			w->last_bdp = (((bdp * CAL_UNIT) >> CAL_SCALE) + BW_UNIT - 1) / BW_UNIT;
+			bdp = ((u64)bw * w->min_rtt_us) / BW_UNIT;
+			w->last_bdp = max_t(u32, (u32)bdp, 10);
 		}
-		tp->snd_ssthresh = max_t(u32, 2, tp->snd_cwnd >> 1);
+
+		tp->snd_ssthresh = max_t(u32, 10, (tp->snd_cwnd * 99) / 100);
+		if (tp->snd_ssthresh < w->last_bdp)
+			tp->snd_ssthresh = w->last_bdp;
+
 	} else if (state == TCP_CA_Open && prev_state != TCP_CA_Open) {
-		tp->snd_cwnd = w->last_bdp;
-		tcp_westwood_cwnd_reduction(sk, rs->acked_sacked, 1);
+		tp->snd_cwnd = tp->snd_ssthresh;
+		tcp_westwood_cwnd_reduction(sk, W_ACKED, 1);
 	} else if (state == TCP_CA_Open) {
-		tcp_reno_cong_avoid(sk, 0, rs->acked_sacked);
+		tcp_westwood_cong_avoid(sk, 0, W_ACKED);
+                tp->snd_cwnd_clamp = ~0U;
+                tp->gso_segs = 64;
+                sk->sk_pacing_status = SK_PACING_NEEDED;
+                if (tp->snd_cwnd < 10000)
+                    tp->snd_cwnd += 10;
 	}
+
+	WRITE_ONCE(sk->sk_pacing_rate, ~0ULL);
+
 	if (debug)
 		printk("##st:%d->%d bw:%llu last_bdp:%d cwnd:%d minrtt:%d\n", prev_state, state, bw, w->last_bdp, tp->snd_cwnd, w->min_rtt_us);
 }
@@ -197,7 +245,7 @@ static struct tcp_congestion_ops tcp_westwood __read_mostly = {
 	.cwnd_event	= tcp_westwood_event,
 	.get_info	= tcp_westwood_info,
 	.owner		= THIS_MODULE,
-	.name		= "westwood"
+	.name		= "westwood_max"
 };
 
 static int __init tcp_westwood_register(void)
@@ -214,6 +262,6 @@ static void __exit tcp_westwood_unregister(void)
 module_init(tcp_westwood_register);
 module_exit(tcp_westwood_unregister);
 
-MODULE_AUTHOR("Stephen Hemminger, Angelo Dell'Aera");
+MODULE_AUTHOR("Stephen Hemminger, Angelo Dell'Aera, maxsteeel");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("TCP Westwood+");
+MODULE_DESCRIPTION("TCP Westwood+ Max");

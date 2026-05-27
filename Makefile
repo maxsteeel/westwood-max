@@ -1,4 +1,4 @@
-obj-m := tcp_westwood.o
+obj-m := tcp_westwood_max.o
 
 PWD:=$(shell pwd)
 KVER:=$(shell uname -r)
